@@ -1,0 +1,6 @@
+applications/**/sessions
+applications/**/databases
+applications/**/errors
+*.log
+*.w2p
+parameters_*.py

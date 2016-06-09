@@ -22,7 +22,7 @@ import decimal
 import unicodedata
 from cStringIO import StringIO
 from gluon.utils import simple_hash, web2py_uuid, DIGEST_ALG_BY_SIZE
-from pydal.objects import FieldVirtual, FieldMethod
+from pydal.objects import Field, FieldVirtual, FieldMethod
 
 regex_isint = re.compile('^[+-]?\d+$')
 
@@ -141,7 +141,6 @@ class Validator(object):
 
     def __call__(self, value):
         raise NotImplementedError
-        return (value, None)
 
 
 class IS_MATCH(Validator):
@@ -200,10 +199,16 @@ class IS_MATCH(Validator):
         self.is_unicode = is_unicode
 
     def __call__(self, value):
-        if self.is_unicode and not isinstance(value, unicode):
-            match = self.regex.search(str(value).decode('utf8'))
+        if self.is_unicode:
+            if not isinstance(value, unicode):
+                match = self.regex.search(str(value).decode('utf8'))
+            else:
+                match = self.regex.search(value)
         else:
-            match = self.regex.search(str(value))
+            if not isinstance(value, unicode):
+                match = self.regex.search(str(value))
+            else:
+                match = self.regex.search(value.encode('utf8'))
         if match is not None:
             return (self.extract and match.group() or value, None)
         return (value, translate(self.error_message))
@@ -371,8 +376,8 @@ class IS_JSON(Validator):
     def __call__(self, value):
         try:
             if self.native_json:
-                simplejson.loads(value) # raises error in case of malformed json
-                return (value, None) #  the serialized value is not passed
+                simplejson.loads(value)  # raises error in case of malformed json
+                return (value, None)  # the serialized value is not passed
             else:
                 return (simplejson.loads(value), None)
         except JSONErrors:
@@ -454,7 +459,7 @@ class IS_IN_SET(Validator):
 
     def __call__(self, value):
         if self.multiple:
-            ### if below was values = re.compile("[\w\-:]+").findall(str(value))
+            # if below was values = re.compile("[\w\-:]+").findall(str(value))
             if not value:
                 values = []
             elif isinstance(value, (tuple, list)):
@@ -466,8 +471,6 @@ class IS_IN_SET(Validator):
         thestrset = [str(x) for x in self.theset]
         failures = [x for x in values if not str(x) in thestrset]
         if failures and self.theset:
-            if self.multiple and (value is None or value == ''):
-                return ([], None)
             return (value, translate(self.error_message))
         if self.multiple:
             if isinstance(self.multiple, (tuple, list)) and \
@@ -506,34 +509,44 @@ class IS_IN_DB(Validator):
         zero='',
         sort=False,
         _and=None,
-        left=None
+        left=None,
+        delimiter=None,
+        auto_add=False,
     ):
         from pydal.objects import Table
-        if isinstance(field, Table):
-            field = field._id
-
         if hasattr(dbset, 'define_table'):
             self.dbset = dbset()
         else:
             self.dbset = dbset
+
+        if isinstance(field, Table):
+            field = field._id
+        elif isinstance(field, str):
+            items = field.split('.')
+            if len(items) == 1:
+                field = items[0] + '.id'
+
         (ktable, kfield) = str(field).split('.')
         if not label:
             label = '%%(%s)s' % kfield
         if isinstance(label, str):
             if regex1.match(str(label)):
                 label = '%%(%s)s' % str(label).split('.')[-1]
-            ks = regex2.findall(label)
-            if kfield not in ks:
-                ks += [kfield]
-            fields = ks
+            fieldnames = regex2.findall(label)
+            if kfield not in fieldnames:
+                fieldnames.append(kfield)  # kfield must be last
+        elif isinstance(label, Field):
+            fieldnames = [label.name, kfield]  # kfield must be last
+            label = '%%(%s)s' % label.name
+        elif callable(label):
+            fieldnames = '*'
         else:
-            ks = [kfield]
-            fields = 'all'
-        self.fields = fields
+            raise NotImplementedError
+
+        self.fieldnames = fieldnames  # fields requires to build the formatting
         self.label = label
         self.ktable = ktable
         self.kfield = kfield
-        self.ks = ks
         self.error_message = error_message
         self.theset = None
         self.orderby = orderby
@@ -545,6 +558,8 @@ class IS_IN_DB(Validator):
         self.sort = sort
         self._and = _and
         self.left = left
+        self.delimiter = delimiter
+        self.auto_add = auto_add
 
     def set_self_id(self, id):
         if self._and:
@@ -552,10 +567,10 @@ class IS_IN_DB(Validator):
 
     def build_set(self):
         table = self.dbset.db[self.ktable]
-        if self.fields == 'all':
+        if self.fieldnames == '*':
             fields = [f for f in table]
         else:
-            fields = [table[k] for k in self.fields]
+            fields = [table[k] for k in self.fieldnames]
         ignore = (FieldVirtual, FieldMethod)
         fields = filter(lambda f: not isinstance(f, ignore), fields)
         if self.dbset.db._dbname != 'gae':
@@ -588,18 +603,41 @@ class IS_IN_DB(Validator):
             items.insert(0, ('', self.zero))
         return items
 
+    def maybe_add(self, table, fieldname, value):
+        d = {fieldname: value}
+        record = table(**d)
+        if record:
+            return record.id
+        else:
+            return table.insert(**d)
+
     def __call__(self, value):
         table = self.dbset.db[self.ktable]
         field = table[self.kfield]
+
         if self.multiple:
             if self._and:
                 raise NotImplementedError
             if isinstance(value, list):
                 values = value
+            elif self.delimiter:
+                values = value.split(self.delimiter)  # because of autocomplete
             elif value:
                 values = [value]
             else:
                 values = []
+
+            if field.type in ('id', 'integer'):
+                new_values = []
+                for value in values:
+                    if not (isinstance(value, (int, long)) or value.isdigit()):
+                        if self.auto_add:
+                            value = str(self.maybe_add(table, self.fieldnames[0], value))
+                        else:
+                            return (values, translate(self.error_message))
+                    new_values.append(value)
+                values = new_values
+
             if isinstance(self.multiple, (tuple, list)) and \
                     not self.multiple[0] <= len(values) < self.multiple[1]:
                 return (values, translate(self.error_message))
@@ -607,29 +645,42 @@ class IS_IN_DB(Validator):
                 if not [v for v in values if v not in self.theset]:
                     return (values, None)
             else:
-                from pydal.adapters import GoogleDatastoreAdapter
-
                 def count(values, s=self.dbset, f=field):
                     return s(f.belongs(map(int, values))).count()
-                if GoogleDatastoreAdapter is not None and isinstance(self.dbset.db._adapter, GoogleDatastoreAdapter):
+
+                if self.dbset.db._adapter.dbengine == "google:datastore":
                     range_ids = range(0, len(values), 30)
                     total = sum(count(values[i:i + 30]) for i in range_ids)
                     if total == len(values):
                         return (values, None)
                 elif count(values) == len(values):
                     return (values, None)
-        elif self.theset:
-            if str(value) in self.theset:
-                if self._and:
-                    return self._and(value)
-                else:
-                    return (value, None)
         else:
-            if self.dbset(field == value).count():
-                if self._and:
-                    return self._and(value)
+            if field.type in ('id', 'integer'):
+                if isinstance(value, (int, long)) or value.isdigit():
+                    value = int(value)
+                elif self.auto_add:
+                    value = self.maybe_add(table, self.fieldnames[0], value)
                 else:
-                    return (value, None)
+                    return (value, translate(self.error_message))
+
+                try:
+                    value = int(value)
+                except TypeError:
+                    return (values, translate(self.error_message))
+
+            if self.theset:
+                if str(value) in self.theset:
+                    if self._and:
+                        return self._and(value)
+                    else:
+                        return (value, None)
+            else:
+                if self.dbset(field == value).count():
+                    if self._and:
+                        return self._and(value)
+                    else:
+                        return (value, None)
         return (value, translate(self.error_message))
 
 
@@ -691,7 +742,7 @@ class IS_NOT_IN_DB(Validator):
                 return (value, translate(self.error_message))
         else:
             row = subset.select(table._id, field, limitby=(0, 1), orderby_on_limitby=False).first()
-            if row and str(row.id) != str(id):
+            if row and str(row[table._id]) != str(id):
                 return (value, translate(self.error_message))
         return (value, None)
 
@@ -766,7 +817,7 @@ class IS_INT_IN_RANGE(Validator):
         if regex_isint.match(str(value)):
             v = int(value)
             if ((self.minimum is None or v >= self.minimum) and
-                (self.maximum is None or v < self.maximum)):
+                    (self.maximum is None or v < self.maximum)):
                 return (v, None)
         return (value, self.error_message)
 
@@ -840,7 +891,7 @@ class IS_FLOAT_IN_RANGE(Validator):
             else:
                 v = float(str(value).replace(self.dot, '.'))
             if ((self.minimum is None or v >= self.minimum) and
-                (self.maximum is None or v <= self.maximum)):
+                    (self.maximum is None or v <= self.maximum)):
                 return (v, None)
         except (ValueError, TypeError):
             pass
@@ -926,7 +977,7 @@ class IS_DECIMAL_IN_RANGE(Validator):
             else:
                 v = decimal.Decimal(str(value).replace(self.dot, '.'))
             if ((self.minimum is None or v >= self.minimum) and
-                (self.maximum is None or v <= self.maximum)):
+                    (self.maximum is None or v <= self.maximum)):
                 return (v, None)
         except (ValueError, TypeError, decimal.InvalidOperation):
             pass
@@ -1146,7 +1197,12 @@ class IS_EMAIL(Validator):
         self.error_message = error_message
 
     def __call__(self, value):
-        match = self.regex.match(value)
+        try:
+            match = self.regex.match(value)
+        except TypeError:
+            # Value may not be a string where we can look for matches.
+            # Example: we're calling ANY_OF formatter and IS_EMAIL is asked to validate a date.
+            match = None
         if match:
             domain = value.split('@')[1]
             if (not self.banned or not self.banned.match(domain)) \
@@ -2162,29 +2218,22 @@ class IS_DATE(Validator):
             INPUT(_type='text', _name='name', requires=IS_DATE())
 
     date has to be in the ISO8960 format YYYY-MM-DD
-    timezome must be None or a pytz.timezone("America/Chicago") object
     """
 
     def __init__(self, format='%Y-%m-%d',
-                 error_message='Enter date as %(format)s',
-                 timezone=None):
+                 error_message='Enter date as %(format)s'):
         self.format = translate(format)
         self.error_message = str(error_message)
-        self.timezone = timezone
         self.extremes = {}
 
     def __call__(self, value):
         ovalue = value
         if isinstance(value, datetime.date):
-            if self.timezone is not None:
-                value = value - datetime.timedelta(seconds=self.timezone*3600)
             return (value, None)
         try:
             (y, m, d, hh, mm, ss, t0, t1, t2) = \
                 time.strptime(value, str(self.format))
             value = datetime.date(y, m, d)
-            if self.timezone is not None:
-                value = self.timezone.localize(value).astimezone(utc)
             return (value, None)
         except:
             self.extremes.update(IS_DATETIME.nice(self.format))
@@ -2200,11 +2249,7 @@ class IS_DATE(Validator):
         format = format.replace('%Y', y)
         if year < 1900:
             year = 2000
-        if self.timezone is not None:
-            d = datetime.datetime(year, value.month, value.day)
-            d = d.replace(tzinfo=utc).astimezone(self.timezone)
-        else:
-            d = datetime.date(year, value.month, value.day)
+        d = datetime.date(year, value.month, value.day)
         return d.strftime(format)
 
 
@@ -2255,7 +2300,8 @@ class IS_DATETIME(Validator):
                 time.strptime(value, str(self.format))
             value = datetime.datetime(y, m, d, hh, mm, ss)
             if self.timezone is not None:
-                value = self.timezone.localize(value).astimezone(utc)
+                # TODO: https://github.com/web2py/web2py/issues/1094 (temporary solution)
+                value = self.timezone.localize(value).astimezone(utc).replace(tzinfo=None)
             return (value, None)
         except:
             self.extremes.update(IS_DATETIME.nice(self.format))
@@ -2300,12 +2346,12 @@ class IS_DATE_IN_RANGE(IS_DATE):
             (datetime.date(2010, 3, 3), 'oops')
 
     """
+
     def __init__(self,
                  minimum=None,
                  maximum=None,
                  format='%Y-%m-%d',
-                 error_message=None,
-                 timezone=None):
+                 error_message=None):
         self.minimum = minimum
         self.maximum = maximum
         if error_message is None:
@@ -2317,8 +2363,7 @@ class IS_DATE_IN_RANGE(IS_DATE):
                 error_message = "Enter date in range %(min)s %(max)s"
         IS_DATE.__init__(self,
                          format=format,
-                         error_message=error_message,
-                         timezone=timezone)
+                         error_message=error_message)
         self.extremes = dict(min=self.formatter(minimum),
                              max=self.formatter(maximum))
 
@@ -2355,6 +2400,7 @@ class IS_DATETIME_IN_RANGE(IS_DATETIME):
             (datetime.datetime(2010, 3, 3, 0, 0), 'oops')
 
     """
+
     def __init__(self,
                  minimum=None,
                  maximum=None,
@@ -2468,7 +2514,7 @@ def urlify(s, maxlen=80, keep_underscores=False):
     if keep_underscores:
         s = re.sub('\s+', '-', s)         # whitespace to hyphens
         s = re.sub('[^\w\-]', '', s)
-                   # strip all but alphanumeric/underscore/hyphen
+        # strip all but alphanumeric/underscore/hyphen
     else:
         s = re.sub('[\s_]+', '-', s)      # whitespace & underscores to hyphens
         s = re.sub('[^a-z0-9\-]', '', s)  # strip all but alphanumeric/hyphen
@@ -2566,7 +2612,7 @@ class ANY_OF(Validator):
         # Use the formatter of the first subvalidator
         # that validates the value and has a formatter
         for validator in self.subs:
-            if hasattr(validator, 'formatter') and validator(value)[1] != None:
+            if hasattr(validator, 'formatter') and validator(value)[1] is None:
                 return validator.formatter(value)
 
 
@@ -2599,8 +2645,8 @@ class IS_EMPTY_OR(Validator):
         if hasattr(other, 'options'):
             self.options = self._options
 
-    def _options(self):
-        options = self.other.options()
+    def _options(self, *args, **kwargs):
+        options = self.other.options(*args, **kwargs)
         if (not options or options[0][0] != '') and not self.multiple:
             options.insert(0, ('', ''))
         return options
@@ -2660,6 +2706,7 @@ class LazyCrypt(object):
     """
     Stores a lazy password hash
     """
+
     def __init__(self, crypt, password):
         """
         crypt is an instance of the CRYPT validator,
@@ -2715,8 +2762,8 @@ class LazyCrypt(object):
         # LazyCrypt objects comparison
         if isinstance(stored_password, self.__class__):
             return ((self is stored_password) or
-                   ((self.crypt.key == stored_password.crypt.key) and
-                   (self.password == stored_password.password)))
+                    ((self.crypt.key == stored_password.crypt.key) and
+                     (self.password == stored_password.password)))
 
         if self.crypt.key:
             if ':' in self.crypt.key:
@@ -2844,9 +2891,11 @@ class CRYPT(object):
         self.salt = salt
 
     def __call__(self, value):
-        value = value and value[:self.max_length]
-        if len(value) < self.min_length:
+        v = value and str(value)[:self.max_length]
+        if not v or len(v) < self.min_length:
             return ('', translate(self.error_message))
+        if isinstance(value, LazyCrypt):
+            return (value, None)
         return (LazyCrypt(self, value), None)
 
 #  entropy calculator for IS_STRONG
@@ -3016,21 +3065,6 @@ class IS_STRONG(object):
             return (value, XML('<br />'.join(failures)))
         else:
             return (value, translate(self.error_message))
-
-
-class IS_IN_SUBSET(IS_IN_SET):
-
-    REGEX_W = re.compile('\w+')
-
-    def __init__(self, *a, **b):
-        IS_IN_SET.__init__(self, *a, **b)
-
-    def __call__(self, value):
-        values = self.REGEX_W.findall(str(value))
-        failures = [x for x in values if IS_IN_SET.__call__(self, x)[1]]
-        if failures:
-            return (value, translate(self.error_message))
-        return (value, None)
 
 
 class IS_IMAGE(Validator):
@@ -3372,13 +3406,14 @@ class IS_IPV4(Validator):
                     ok = True
             if not (self.is_localhost is None or self.is_localhost ==
                     (number == self.localhost)):
-                    ok = False
+                ok = False
             if not (self.is_private is None or self.is_private ==
-                    (sum([number[0] <= number <= number[1] for number in self.private]) > 0)):
-                    ok = False
+                    (sum([private_number[0] <= number <= private_number[1]
+                          for private_number in self.private]) > 0)):
+                ok = False
             if not (self.is_automatic is None or self.is_automatic ==
                     (self.automatic[0] <= number <= self.automatic[1])):
-                    ok = False
+                ok = False
             if ok:
                 return (value, None)
         return (value, translate(self.error_message))
@@ -3479,7 +3514,7 @@ class IS_IPV6(Validator):
             from gluon.contrib import ipaddr as ipaddress
 
         try:
-            ip = ipaddress.IPv6Address(value)
+            ip = ipaddress.IPv6Address(value.decode('utf-8'))
             ok = True
         except ipaddress.AddressValueError:
             return (value, translate(self.error_message))
@@ -3491,7 +3526,7 @@ class IS_IPV6(Validator):
                 self.subnets = [self.subnets]
             for network in self.subnets:
                 try:
-                    ipnet = ipaddress.IPv6Network(network)
+                    ipnet = ipaddress.IPv6Network(network.decode('utf-8'))
                 except (ipaddress.NetmaskValueError, ipaddress.AddressValueError):
                     return (value, translate('invalid subnet provided'))
                 if ip in ipnet:
@@ -3662,6 +3697,7 @@ class IS_IPADDRESS(Validator):
         >>> IS_IPADDRESS(subnets='invalidsubnet')('2001::8ffa:fe22:b3af')
         ('2001::8ffa:fe22:b3af', 'invalid subnet provided')
     """
+
     def __init__(
             self,
             minip='0.0.0.0',
@@ -3700,20 +3736,22 @@ class IS_IPADDRESS(Validator):
 
     def __call__(self, value):
         try:
-            import ipaddress
+            from ipaddress import ip_address as IPAddress
+            from ipaddress import IPv6Address, IPv4Address
         except ImportError:
-            from gluon.contrib import ipaddr as ipaddress
+            from gluon.contrib.ipaddr import (IPAddress, IPv4Address,
+                                              IPv6Address)
 
         try:
-            ip = ipaddress.IPAddress(value)
-        except ValueError, e:
+            ip = IPAddress(value.decode('utf-8'))
+        except ValueError:
             return (value, translate(self.error_message))
 
-        if self.is_ipv4 and isinstance(ip, ipaddress.IPv6Address):
+        if self.is_ipv4 and isinstance(ip, IPv6Address):
             retval = (value, translate(self.error_message))
-        elif self.is_ipv6 and isinstance(ip, ipaddress.IPv4Address):
+        elif self.is_ipv6 and isinstance(ip, IPv4Address):
             retval = (value, translate(self.error_message))
-        elif self.is_ipv4 or isinstance(ip, ipaddress.IPv4Address):
+        elif self.is_ipv4 or isinstance(ip, IPv4Address):
             retval = IS_IPV4(
                 minip=self.minip,
                 maxip=self.maxip,
@@ -3722,8 +3760,8 @@ class IS_IPADDRESS(Validator):
                 is_private=self.is_private,
                 is_automatic=self.is_automatic,
                 error_message=self.error_message
-                )(value)
-        elif self.is_ipv6 or isinstance(ip, ipaddress.IPv6Address):
+            )(value)
+        elif self.is_ipv6 or isinstance(ip, IPv6Address):
             retval = IS_IPV6(
                 is_private=self.is_private,
                 is_link_local=self.is_link_local,
@@ -3734,7 +3772,7 @@ class IS_IPADDRESS(Validator):
                 is_teredo=self.is_teredo,
                 subnets=self.subnets,
                 error_message=self.error_message
-                )(value)
+            )(value)
         else:
             retval = (value, translate(self.error_message))
 

@@ -10,7 +10,6 @@ from .base import BaseAdapter
 
 long = integer_types[-1]
 
-
 class MSSQLAdapter(BaseAdapter):
     drivers = ('pyodbc',)
     T_SEP = 'T'
@@ -34,14 +33,14 @@ class MSSQLAdapter(BaseAdapter):
         'time': 'CHAR(8)',
         'datetime': 'DATETIME',
         'id': 'INT IDENTITY PRIMARY KEY',
-        'reference': 'INT NULL, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
+        'reference': 'INT %(null)s %(unique)s, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'list:integer': 'TEXT',
         'list:string': 'TEXT',
         'list:reference': 'TEXT',
         'geometry': 'geometry',
         'geography': 'geography',
         'big-id': 'BIGINT IDENTITY PRIMARY KEY',
-        'big-reference': 'BIGINT NULL, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
+        'big-reference': 'BIGINT %(null)s %(unique)s, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'reference FK': ', CONSTRAINT FK_%(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'reference TFK': ' CONSTRAINT FK_%(foreign_table)s_PK FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_table)s (%(foreign_key)s) ON DELETE %(on_delete_action)s',
         }
@@ -62,7 +61,7 @@ class MSSQLAdapter(BaseAdapter):
         return 'NEWID()'
 
     def ALLOW_NULL(self):
-        return ' NULL'
+        return ' %s' % 'NULL'
 
     def CAST(self, first, second):
         return first # apparently no cast necessary in MSSQL
@@ -91,7 +90,7 @@ class MSSQLAdapter(BaseAdapter):
     FALSE = 0
 
     REGEX_DSN = re.compile('^(?P<dsn>.+)$')
-    REGEX_URI = re.compile('^(?P<user>[^:@]+)(\:(?P<password>[^@]*))?@(?P<host>[^\:/]+)(\:(?P<port>[0-9]+))?/(?P<db>[^\?]+)(\?(?P<urlargs>.*))?$')
+    REGEX_URI = re.compile('^(?P<user>[^:@]+)(\:(?P<password>[^@]*))?@(?P<host>\[[^/]+\]|[^\:/]+)(\:(?P<port>[0-9]+))?/(?P<db>[^\?]+)(\?(?P<urlargs>.*))?$')
     REGEX_ARGPATTERN = re.compile('(?P<argkey>[^=]+)=(?P<argvalue>[^&]*)')
 
     def __init__(self, db, uri, pool_size=0, folder=None, db_codec='UTF-8',
@@ -173,7 +172,74 @@ class MSSQLAdapter(BaseAdapter):
         return "DATEDIFF(second, '1970-01-01 00:00:00', %s)" % self.expand(first)
 
     def CONCAT(self, *items):
-        return '(%s)' % ' + '.join(self.expand(x,'string') for x in items)
+        return '(%s)' % ' + '.join(self.expand(x, 'string') for x in items)
+
+    def REGEXP(self, first, second):
+        second = self.expand(second, 'string').replace('\\', '\\\\')
+        second = second.replace('%', '\%').replace('*', '%').replace('.', '_')
+        return "(%s LIKE %s ESCAPE '\\')" % (self.expand(first), second)
+
+    def mssql_like_normalizer(self, term):
+        term = term.replace('[', '[[]')
+        return term
+
+    def like_escaper_default(self, term):
+        if isinstance(term, Expression):
+            return term
+        term = term.replace('\\', '\\\\')
+        term = term.replace('%', '\%').replace('_', '\_')
+        return self.mssql_like_normalizer(term)
+
+    def LIKE(self, first, second, escape=None):
+        """Case sensitive like operator"""
+        if isinstance(second, Expression):
+            second = self.expand(second, 'string')
+        else:
+            second = self.expand(second, 'string')
+            if escape is None:
+                escape = '\\'
+                second = second.replace(escape, escape * 2)
+        return "(%s LIKE %s ESCAPE '%s')" % (self.expand(first),
+                second, escape)
+
+    def ILIKE(self, first, second, escape=None):
+        """Case insensitive like operator"""
+        if isinstance(second, Expression):
+            second = self.expand(second, 'string')
+        else:
+            second = self.expand(second, 'string').lower()
+            if escape is None:
+                escape = '\\'
+                second = second.replace(escape, escape*2)
+        return "(LOWER(%s) LIKE %s ESCAPE '%s')" % (self.expand(first),
+                second, escape)
+
+    def STARTSWITH(self, first, second):
+        return "(%s LIKE %s ESCAPE '\\')" % (self.expand(first),
+                self.expand(self.like_escaper_default(second)+'%', 'string'))
+
+    def ENDSWITH(self, first, second):
+        return "(%s LIKE %s ESCAPE '\\')" % (self.expand(first),
+                self.expand('%'+self.like_escaper_default(second), 'string'))
+
+    def CONTAINS(self, first, second, case_sensitive=True):
+        if first.type in ('string', 'text', 'json'):
+            if isinstance(second, Expression):
+                second = Expression(second.db, self.CONCAT('%',Expression(
+                            second.db, self.REPLACE(second,('%','\%'))),'%'))
+            else:
+                second = '%'+self.like_escaper_default(str(second))+'%'
+        elif first.type.startswith('list:'):
+            if isinstance(second,Expression):
+                second = Expression(second.db, self.CONCAT(
+                        '%|',Expression(second.db, self.REPLACE(
+                                Expression(second.db, self.REPLACE(
+                                        second,('%','\%'))),('|','||'))),'|%'))
+            else:
+                second = str(second).replace('|', '||')
+                second = '%|'+self.like_escaper_default(second)+'|%'
+        op = case_sensitive and self.LIKE or self.ILIKE
+        return op(first, second, escape='\\')
 
     # GIS Spatial Extensions
 
@@ -248,14 +314,14 @@ class MSSQL3Adapter(MSSQLAdapter):
         'time': 'TIME(7)',
         'datetime': 'DATETIME',
         'id': 'INT IDENTITY PRIMARY KEY',
-        'reference': 'INT NULL, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
+        'reference': 'INT %(null)s %(unique)s, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'list:integer': 'VARCHAR(MAX)',
         'list:string': 'VARCHAR(MAX)',
         'list:reference': 'VARCHAR(MAX)',
         'geometry': 'geometry',
         'geography': 'geography',
         'big-id': 'BIGINT IDENTITY PRIMARY KEY',
-        'big-reference': 'BIGINT NULL, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
+        'big-reference': 'BIGINT %(null)s %(unique)s, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'reference FK': ', CONSTRAINT FK_%(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'reference TFK': ' CONSTRAINT FK_%(foreign_table)s_PK FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_table)s (%(foreign_key)s) ON DELETE %(on_delete_action)s',
     }
@@ -276,7 +342,7 @@ class MSSQL3Adapter(MSSQLAdapter):
             sql_f_oproxy = ', '.join(sql_f_outer)
             return 'SELECT %s %s FROM (SELECT %s ROW_NUMBER() OVER (ORDER BY %s) AS w_row, %s FROM %s%s%s) TMP WHERE w_row BETWEEN %i AND %s;' % (sql_s,sql_f_oproxy,sql_s,sql_f,sql_f_iproxy,sql_t,sql_w,sql_g_inner,lmin,lmax)
         return 'SELECT %s %s FROM %s%s%s;' % (sql_s,sql_f,sql_t,sql_w,sql_o)
-    
+
     def rowslice(self,rows,minimum=0,maximum=None):
         return rows
 
@@ -304,14 +370,14 @@ class MSSQL4Adapter(MSSQLAdapter):
         'time': 'TIME(7)',
         'datetime': 'DATETIME',
         'id': 'INT IDENTITY PRIMARY KEY',
-        'reference': 'INT NULL, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
+        'reference': 'INT %(null)s %(unique)s, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'list:integer': 'VARCHAR(MAX)',
         'list:string': 'VARCHAR(MAX)',
         'list:reference': 'VARCHAR(MAX)',
         'geometry': 'geometry',
         'geography': 'geography',
         'big-id': 'BIGINT IDENTITY PRIMARY KEY',
-        'big-reference': 'BIGINT NULL, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
+        'big-reference': 'BIGINT %(null)s %(unique)s, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'reference FK': ', CONSTRAINT FK_%(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'reference TFK': ' CONSTRAINT FK_%(foreign_table)s_PK FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_table)s (%(foreign_key)s) ON DELETE %(on_delete_action)s',
     }
@@ -357,14 +423,14 @@ class MSSQL2Adapter(MSSQLAdapter):
         'time': 'CHAR(8)',
         'datetime': 'DATETIME',
         'id': 'INT IDENTITY PRIMARY KEY',
-        'reference': 'INT, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
+        'reference': 'INT %(null)s %(unique)s, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'list:integer': 'NTEXT',
         'list:string': 'NTEXT',
         'list:reference': 'NTEXT',
         'geometry': 'geometry',
         'geography': 'geography',
         'big-id': 'BIGINT IDENTITY PRIMARY KEY',
-        'big-reference': 'BIGINT, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
+        'big-reference': 'BIGINT %(null)s %(unique)s, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'reference FK': ', CONSTRAINT FK_%(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'reference TFK': ' CONSTRAINT FK_%(foreign_table)s_PK FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_table)s (%(foreign_key)s) ON DELETE %(on_delete_action)s',
     }
@@ -383,11 +449,20 @@ class MSSQL2Adapter(MSSQLAdapter):
         return self.log_execute(*a, **b)
         #return self.log_execute(a.decode('utf8'))
 
-    def ILIKE(self, first, second):
-        second = self.expand(second, 'string').lower()
+
+    def ILIKE(self, first, second, escape=None):
+        """Case insensitive like operator"""
+        if isinstance(second, Expression):
+            second = self.expand(second, 'string')
+        else:
+            second = self.expand(second, 'string').lower()
+            if escape is None:
+                escape = '\\'
+                second = second.replace(escape, escape*2)
         if second.startswith("n'"):
             second = "N'" + second[2:]
-        return '(LOWER(%s) LIKE %s)' % (self.expand(first), second)
+        return "(LOWER(%s) LIKE %s ESCAPE '%s')" % (self.expand(first),
+                second, escape)
 
 
 class MSSQLNAdapter(MSSQLAdapter):
@@ -417,14 +492,14 @@ class MSSQLNAdapter(MSSQLAdapter):
         'time': 'CHAR(8)',
         'datetime': 'DATETIME',
         'id': 'INT IDENTITY PRIMARY KEY',
-        'reference': 'INT, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
+        'reference': 'INT %(null)s %(unique)s, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'list:integer': 'NTEXT',
         'list:string': 'NTEXT',
         'list:reference': 'NTEXT',
         'geometry': 'geometry',
         'geography': 'geography',
         'big-id': 'BIGINT IDENTITY PRIMARY KEY',
-        'big-reference': 'BIGINT, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
+        'big-reference': 'BIGINT %(null)s %(unique)s, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'reference FK': ', CONSTRAINT FK_%(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'reference TFK': ' CONSTRAINT FK_%(foreign_table)s_PK FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_table)s (%(foreign_key)s) ON DELETE %(on_delete_action)s',
     }
@@ -442,14 +517,20 @@ class MSSQLNAdapter(MSSQLAdapter):
             a = tuple(newa)
         return self.log_execute(*a, **b)
 
-    def ILIKE(self, first, second):
+    def ILIKE(self, first, second, escape=None):
+        """Case insensitive like operator"""
         if isinstance(second, Expression):
             second = self.expand(second, 'string')
         else:
             second = self.expand(second, 'string').lower()
-            if second.startswith("n'"):
-                second = "N'" + second[2:]
-        return '(LOWER(%s) LIKE %s)' % (self.expand(first), second)
+            if escape is None:
+                escape = '\\'
+                second = second.replace(escape, escape*2)
+        if second.startswith("n'"):
+            second = "N'" + second[2:]
+        return "(LOWER(%s) LIKE %s ESCAPE '%s')" % (self.expand(first),
+                second, escape)
+
 
 
 class MSSQL3NAdapter(MSSQLNAdapter):
@@ -478,14 +559,14 @@ class MSSQL3NAdapter(MSSQLNAdapter):
         'time': 'TIME(7)',
         'datetime': 'DATETIME',
         'id': 'INT IDENTITY PRIMARY KEY',
-        'reference': 'INT NULL, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
+        'reference': 'INT %(null)s %(unique)s, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'list:integer': 'NVARCHAR(MAX)',
         'list:string': 'NVARCHAR(MAX)',
         'list:reference': 'NVARCHAR(MAX)',
         'geometry': 'geometry',
         'geography': 'geography',
         'big-id': 'BIGINT IDENTITY PRIMARY KEY',
-        'big-reference': 'BIGINT NULL, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
+        'big-reference': 'BIGINT %(null)s %(unique)s, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'reference FK': ', CONSTRAINT FK_%(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'reference TFK': ' CONSTRAINT FK_%(foreign_table)s_PK FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_table)s (%(foreign_key)s) ON DELETE %(on_delete_action)s',
     }
@@ -538,14 +619,14 @@ class MSSQL4NAdapter(MSSQLNAdapter):
         'time': 'TIME(7)',
         'datetime': 'DATETIME',
         'id': 'INT IDENTITY PRIMARY KEY',
-        'reference': 'INT NULL, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
+        'reference': 'INT %(null)s %(unique)s, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'list:integer': 'NVARCHAR(MAX)',
         'list:string': 'NVARCHAR(MAX)',
         'list:reference': 'NVARCHAR(MAX)',
         'geometry': 'geometry',
         'geography': 'geography',
         'big-id': 'BIGINT IDENTITY PRIMARY KEY',
-        'big-reference': 'BIGINT NULL, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
+        'big-reference': 'BIGINT %(null)s %(unique)s, CONSTRAINT %(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'reference FK': ', CONSTRAINT FK_%(constraint_name)s FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         'reference TFK': ' CONSTRAINT FK_%(foreign_table)s_PK FOREIGN KEY (%(field_name)s) REFERENCES %(foreign_table)s (%(foreign_key)s) ON DELETE %(on_delete_action)s',
     }
@@ -599,7 +680,6 @@ class VerticaAdapter(MSSQLAdapter):
         'list:reference': 'BYTEA',
         'big-reference': 'BIGINT REFERENCES %(foreign_key)s ON DELETE %(on_delete_action)s',
         }
-
 
     def EXTRACT(self, first, what):
         return "DATE_PART('%s', TIMESTAMP %s)" % (what, self.expand(first))

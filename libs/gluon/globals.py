@@ -208,7 +208,7 @@ class Request(Storage):
     def parse_get_vars(self):
         """Takes the QUERY_STRING and unpacks it to get_vars
         """
-        query_string = self.env.get('QUERY_STRING', '')
+        query_string = self.env.get('query_string', '')
         dget = urlparse.parse_qs(query_string, keep_blank_values=1)  # Ref: https://docs.python.org/2/library/cgi.html#cgi.parse_qs
         get_vars = self._get_vars = Storage(dget)
         for (key, value) in get_vars.iteritems():
@@ -362,20 +362,25 @@ class Request(Storage):
             redirect(URL(scheme='https', args=self.args, vars=self.vars))
 
     def restful(self):
-        def wrapper(action, self=self):
-            def f(_action=action, _self=self, *a, **b):
-                self.is_restful = True
-                method = _self.env.request_method
-                if len(_self.args) and '.' in _self.args[-1]:
-                    _self.args[-1], _, self.extension = self.args[-1].rpartition('.')
+        def wrapper(action, request=self):
+            def f(_action=action, *a, **b):
+                request.is_restful = True
+                env = request.env
+                is_json = env.content_type=='application/json'
+                method = env.request_method
+                if len(request.args) and '.' in request.args[-1]:
+                    request.args[-1], _, request.extension = request.args[-1].rpartition('.')
                     current.response.headers['Content-Type'] = \
-                        contenttype('.' + _self.extension.lower())
+                        contenttype('.' + request.extension.lower())
                 rest_action = _action().get(method, None)
                 if not (rest_action and method == method.upper()
                         and callable(rest_action)):
                     raise HTTP(405, "method not allowed")
                 try:
-                    return rest_action(*_self.args, **getattr(_self, 'vars', {}))
+                    res = rest_action(*request.args, **request.vars)
+                    if is_json and not isinstance(res, str):
+                        res = json(res)
+                    return res
                 except TypeError, e:
                     exc_type, exc_value, exc_traceback = sys.exc_info()
                     if len(traceback.extract_tb(exc_traceback)) == 1:
@@ -807,7 +812,7 @@ class Session(Storage):
         response.session_data_name = 'session_data_%s' % masterapp.lower()
         response.session_cookie_expires = cookie_expires
         response.session_client = str(request.client).replace(':', '.')
-        response.session_cookie_key = cookie_key
+        current._session_cookie_key = cookie_key
         response.session_cookie_compression_level = compression_level
 
         # check if there is a session_id in cookies
@@ -1023,10 +1028,16 @@ class Session(Storage):
     def _fixup_before_save(self):
         response = current.response
         rcookies = response.cookies
-        if self._forget and response.session_id_name in rcookies:
+        scookies = rcookies.get(response.session_id_name)
+        if not scookies:
+            return
+        if self._forget:
             del rcookies[response.session_id_name]
-        elif self._secure and response.session_id_name in rcookies:
-            rcookies[response.session_id_name]['secure'] = True
+            return
+        if self.get('httponly_cookies',True):
+            scookies['HttpOnly'] = True
+        if self._secure:
+            scookies['secure'] = True
 
     def clear_session_cookies(self):
         request = current.request
@@ -1054,7 +1065,7 @@ class Session(Storage):
 
         # if not cookie_key, but session_data_name in cookies
         # expire session_data_name from cookies
-        if not response.session_cookie_key:
+        if not current._session_cookie_key:
             if response.session_data_name in cookies:
                 rcookies[response.session_data_name] = 'expired'
                 rcookies[response.session_data_name]['path'] = '/'
@@ -1074,6 +1085,7 @@ class Session(Storage):
         if response.session_storage_type == 'file':
             target = recfile.generate(response.session_filename)
             try:
+                self._close(response)
                 os.unlink(target)
             except:
                 pass
@@ -1116,7 +1128,7 @@ class Session(Storage):
         name = response.session_data_name
         compression_level = response.session_cookie_compression_level
         value = secure_dumps(dict(self),
-                             response.session_cookie_key,
+                             current._session_cookie_key,
                              compression_level=compression_level)
         rcookies = response.cookies
         rcookies.pop(name, None)

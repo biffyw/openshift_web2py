@@ -27,9 +27,9 @@ from gluon.html import FORM, INPUT, LABEL, OPTION, SELECT, COL, COLGROUP
 from gluon.html import TABLE, THEAD, TBODY, TR, TD, TH, STYLE, SCRIPT
 from gluon.html import URL, FIELDSET, P, DEFAULT_PASSWORD_DISPLAY
 from pydal.base import DEFAULT
-from pydal.objects import Table, Row, Expression, Field
+from pydal.objects import Table, Row, Expression, Field, Set
 from pydal.adapters.base import CALLABLETYPES
-from pydal.helpers.methods import smart_query, bar_encode
+from pydal.helpers.methods import smart_query, bar_encode,  _repr_ref
 from pydal.helpers.classes import Reference, SQLCustomType
 from gluon.storage import Storage
 from gluon.utils import md5_hash
@@ -71,6 +71,26 @@ def represent(field, value, record):
     else:
         raise RuntimeError("field representation must take 1 or 2 args")
 
+class CacheRepresenter(object):
+    def __init__(self):
+        self.cache = {}
+    def __call__(self, field, value, row):
+        cache = self.cache
+        if field not in cache:
+            cache[field] = {}
+        try:
+            nvalue = cache[field][value]
+        except KeyError:
+            try:
+                nvalue = field.represent(value, row)
+            except KeyError:
+                try:
+                    nvalue = field.represent(value, row[field.tablename])
+                except KeyError:
+                    nvalue = None
+            if isinstance(field, _repr_ref):
+                cache[field][value] = nvalue
+        return nvalue
 
 def safe_int(x):
     try:
@@ -626,13 +646,12 @@ class AutocompleteWidget(object):
     def __init__(self, request, field, id_field=None, db=None,
                  orderby=None, limitby=(0, 10), distinct=False,
                  keyword='_autocomplete_%(tablename)s_%(fieldname)s',
-                 min_length=2, help_fields=None, help_string=None):
+                 min_length=2, help_fields=None, help_string=None, at_beginning = True):
 
         self.help_fields = help_fields or []
         self.help_string = help_string
         if self.help_fields and not self.help_string:
-            self.help_string = ' '.join('%%(%s)s' % f.name
-                                        for f in self.help_fields)
+            self.help_string = ' '.join('%%(%s)s' % f.name for f in self.help_fields)
 
         self.request = request
         self.keyword = keyword % dict(tablename=field.tablename,
@@ -642,6 +661,7 @@ class AutocompleteWidget(object):
         self.limitby = limitby
         self.distinct = distinct
         self.min_length = min_length
+        self.at_beginning = at_beginning
         self.fields = [field]
         if id_field:
             self.is_reference = True
@@ -657,10 +677,28 @@ class AutocompleteWidget(object):
     def callback(self):
         if self.keyword in self.request.vars:
             field = self.fields[0]
-            if settings and settings.global_settings.web2py_runtime_gae:
+            if type(field) is Field.Virtual:
+                records = []
+                table_rows = self.db(self.db[field.tablename]).select(orderby=self.orderby)
+                count = 0
+                for row in table_rows:
+                    if self.at_beginning:
+                        if row[field.name].lower().startswith(self.request.vars[self.keyword]):
+                            count += 1
+                            records.append(row)
+                    else:
+                        if self.request.vars[self.keyword] in row[field.name].lower():
+                            count += 1
+                            records.append(row)
+                    if count == 10:
+                        break
+                rows = Rows(self.db, records, table_rows.colnames, compact=table_rows.compact)
+            elif settings and settings.global_settings.web2py_runtime_gae:
                 rows = self.db(field.__ge__(self.request.vars[self.keyword]) & field.__lt__(self.request.vars[self.keyword] + u'\ufffd')).select(orderby=self.orderby, limitby=self.limitby, *(self.fields+self.help_fields))
-            else:
+            elif self.at_beginning:
                 rows = self.db(field.like(self.request.vars[self.keyword] + '%', case_sensitive=False)).select(orderby=self.orderby, limitby=self.limitby, distinct=self.distinct, *(self.fields+self.help_fields))
+            else:
+                rows = self.db(field.contains(self.request.vars[self.keyword], case_sensitive=False)).select(orderby=self.orderby, limitby=self.limitby, distinct=self.distinct, *(self.fields+self.help_fields))
             if rows:
                 if self.is_reference:
                     id_field = self.fields[1]
@@ -703,8 +741,16 @@ class AutocompleteWidget(object):
                 del attr['requires']
             attr['_name'] = key2
             value = attr['value']
-            record = self.db(
-                self.fields[1] == value).select(self.fields[0]).first()
+            if type(self.fields[0]) is Field.Virtual:
+                record = None
+                table_rows = self.db(self.db[self.fields[0].tablename]).select(orderby=self.orderby)
+                for row in table_rows:
+                    if row.id == value:
+                        record = row
+                        break
+            else:
+                record = self.db(
+                    self.fields[1] == value).select(self.fields[0]).first()
             attr['value'] = record and record[self.fields[0].name]
             attr['_onblur'] = "jQuery('#%(div_id)s').delay(1000).fadeOut('slow');" % \
                 dict(div_id=div_id, u='F' + self.keyword)
@@ -714,7 +760,7 @@ class AutocompleteWidget(object):
                      name=name, div_id=div_id, u='F' + self.keyword)
             if self.min_length == 0:
                 attr['_onfocus'] = attr['_onkeyup']
-            return CAT(INPUT(**attr), 
+            return CAT(INPUT(**attr),
                        INPUT(_type='hidden', _id=key3, _value=value,
                              _name=name, requires=field.requires),
                        DIV(_id=div_id, _style='position:absolute;'))
@@ -727,7 +773,7 @@ class AutocompleteWidget(object):
                      key=self.keyword, id=attr['_id'], div_id=div_id, u='F' + self.keyword)
             if self.min_length == 0:
                 attr['_onfocus'] = attr['_onkeyup']
-            return CAT(INPUT(**attr), 
+            return CAT(INPUT(**attr),
                        DIV(_id=div_id, _style='position:absolute;'))
 
 
@@ -818,7 +864,7 @@ def formstyle_bootstrap(form, fields):
             controls.add_class('span4')
 
         if isinstance(label, LABEL):
-            label['_class'] = 'control-label'
+            label['_class'] = add_class(label.get('_class'),'control-label')
 
         if _submit:
             # submit button has unwrapped label and controls, different class
@@ -855,20 +901,21 @@ def formstyle_bootstrap3_stacked(form, fields):
             elif controls['_type'] == 'checkbox':
                 label['_for'] = None
                 label.insert(0, controls)
+                label.insert(0, ' ')
                 _controls = DIV(label, _help, _class="checkbox")
                 label = ''
             elif isinstance(controls, (SELECT, TEXTAREA)):
                 controls.add_class('form-control')
-                            
+
         elif isinstance(controls, SPAN):
             _controls = P(controls.components)
 
         elif isinstance(controls, UL):
             for e in controls.elements("input"):
                 e.add_class('form-control')
-                
+
         if isinstance(label, LABEL):
-            label['_class'] = 'control-label'
+            label['_class'] = add_class(label.get('_class'),'control-label')
 
         parent.append(DIV(label, _controls, _class='form-group', _id=id))
     return parent
@@ -890,7 +937,7 @@ def formstyle_bootstrap3_inline_factory(col_label_size=3):
             # wrappers
             _help = SPAN(help, _class='help-block')
             # embed _help into _controls
-            _controls = DIV(controls, _help, _class=col_class)
+            _controls = DIV(controls, _help, _class="%s" % (col_class))
             if isinstance(controls, INPUT):
                 if controls['_type'] == 'submit':
                     controls.add_class('btn btn-primary')
@@ -904,20 +951,21 @@ def formstyle_bootstrap3_inline_factory(col_label_size=3):
                 elif controls['_type'] == 'checkbox':
                     label['_for'] = None
                     label.insert(0, controls)
+                    label.insert(1, ' ')
                     _controls = DIV(DIV(label, _help, _class="checkbox"),
                                     _class="%s %s" % (offset_class, col_class))
                     label = ''
                 elif isinstance(controls, (SELECT, TEXTAREA)):
                     controls.add_class('form-control')
-                
+
             elif isinstance(controls, SPAN):
-                _controls = P(controls.components, 
+                _controls = P(controls.components,
                               _class="form-control-static %s" % col_class)
             elif isinstance(controls, UL):
                 for e in controls.elements("input"):
                     e.add_class('form-control')
             if isinstance(label, LABEL):
-                label['_class'] = 'control-label %s' % label_col_class
+                label['_class'] = add_class(label.get('_class'),'control-label %s' % label_col_class)
 
             parent.append(DIV(label, _controls, _class='form-group', _id=id))
         return parent
@@ -1100,10 +1148,12 @@ class SQLFORM(FORM):
                 raise HTTP(404, "Object not found")
         self.record = record
 
-        self.record_id = record_id
         if keyed:
             self.record_id = dict([(k, record and str(record[k]) or None)
                                    for k in table._primarykey])
+        else:
+            self.record_id = record_id
+
         self.field_parent = {}
         xfields = []
         self.fields = fields
@@ -1126,7 +1176,8 @@ class SQLFORM(FORM):
         extra_fields = extra_fields or []
         self.extra_fields = {}
         for extra_field in extra_fields:
-            self.fields.append(extra_field.name)
+            if not extra_field.name in self.fields:
+                self.fields.append(extra_field.name)
             self.extra_fields[extra_field.name] = extra_field
             extra_field.db = table._db
             extra_field.table = table
@@ -1160,6 +1211,14 @@ class SQLFORM(FORM):
             label = LABEL(label, label and sep, _for=field_id,
                           _id=field_id + SQLFORM.ID_LABEL_SUFFIX)
 
+            cond = readonly or \
+                (not ignore_rw and not field.writable and field.readable)
+
+            if cond:
+                label['_class'] = 'readonly'
+            else:
+                label['_class'] = ''
+
             row_id = field_id + SQLFORM.ID_ROW_SUFFIX
             if field.type == 'id':
                 self.custom.dspval.id = nbsp
@@ -1188,8 +1247,6 @@ class SQLFORM(FORM):
                 default = field.default
                 if isinstance(default, CALLABLETYPES):
                     default = default()
-            cond = readonly or \
-                (not ignore_rw and not field.writable and field.readable)
 
             if default is not None and not cond:
                 default = field.formatter(default)
@@ -1471,13 +1528,12 @@ class SQLFORM(FORM):
             hideerror=hideerror,
             **kwargs
         )
-
-        self.deleted = \
-            request_vars.get(self.FIELDNAME_REQUEST_DELETE, False)
+        
+        self.deleted = request_vars.get(self.FIELDNAME_REQUEST_DELETE, False)
 
         self.custom.end = CAT(self.hidden_fields(), self.custom.end)
 
-        auch = record_id and self.errors and self.deleted
+        delete_exception = self.record_id and self.errors and self.deleted
 
         if self.record_changed and self.detect_record_change:
             message_onchange = \
@@ -1489,8 +1545,9 @@ class SQLFORM(FORM):
             if message_onchange is not None:
                 current.response.flash = message_onchange
             return ret
-        elif (not ret) and (not auch):
-            # auch is true when user tries to delete a record
+
+        elif (not ret) and (not delete_exception):
+            # delete_exception is true when user tries to delete a record
             # that does not pass validation, yet it should be deleted
             for fieldname in self.fields:
 
@@ -1520,9 +1577,10 @@ class SQLFORM(FORM):
             self.accepted = ret
             return ret
 
-        if record_id and str(record_id) != str(self.record_id):
-            raise SyntaxError('user is tampering with form\'s record_id: '
-                              '%s != %s' % (record_id, self.record_id))
+        if self.record_id:
+            if str(record_id) != str(self.record_id):
+                raise SyntaxError('user is tampering with form\'s record_id: '
+                                  '%s != %s' % (record_id, self.record_id))
 
         if record_id and dbio and not keyed:
             self.vars.id = self.record[self.id_field_name]
@@ -1678,7 +1736,7 @@ class SQLFORM(FORM):
                         self.vars.update(pk)
                     else:
                         ret = False
-            else:
+            elif self.table._db._uri:
                 if record_id:
                     self.vars.id = self.record[self.id_field_name]
                     if fields:
@@ -1686,11 +1744,13 @@ class SQLFORM(FORM):
                                        self.id_field_name]).update(**fields)
                 else:
                     self.vars.id = self.table.insert(**fields)
+
         self.accepted = ret
         return ret
 
     AUTOTYPES = {
         type(''): ('string', None),
+        type(u''): ('string',None),
         type(True): ('boolean', None),
         type(1): ('integer', IS_INT_IN_RANGE(-1e12, +1e12)),
         type(1.0): ('double', IS_FLOAT_IN_RANGE()),
@@ -1755,10 +1815,16 @@ class SQLFORM(FORM):
             keywords = keywords[0]
             request.vars.keywords = keywords
         key = keywords.strip()
-        if key and ' ' not in key and not '"' in key and not "'" in key:
+        if key and not '"' in key:
             SEARCHABLE_TYPES = ('string', 'text', 'list:string')
-            parts = [field.contains(
-                key) for field in fields if field.type in SEARCHABLE_TYPES]
+            sfields = [field for field in fields if field.type in SEARCHABLE_TYPES]
+            if settings.global_settings.web2py_runtime_gae:
+                return reduce(lambda a,b: a|b, [field.contains(key) for field in sfields])
+            else:
+                return reduce(lambda a,b:a&b,[
+                        reduce(lambda a,b: a|b, [
+                                field.contains(k) for field in sfields]
+                               ) for k in key.split()])
 
             # from https://groups.google.com/forum/#!topic/web2py/hKe6lI25Bv4
             # needs testing...
@@ -1772,10 +1838,6 @@ class SQLFORM(FORM):
             #        filters.append(reduce(lambda a, b: (a & b), all_words_filters))
             #parts = filters
 
-        else:
-            parts = None
-        if parts:
-            return reduce(lambda a, b: a | b, parts)
         else:
             return smart_query(fields, key)
 
@@ -1835,28 +1897,39 @@ class SQLFORM(FORM):
                 else:
                     field_type = field.type
 
-                operators = SELECT(*[OPTION(T(option), _value=option) for option in options], _class='form-control')
+                operators = SELECT(*[OPTION(T(option), _value=option) for option in options], 
+                                    _class='form-control')
                 _id = "%s_%s" % (value_id, name)
                 if field_type in ['boolean', 'double', 'time', 'integer']:
-                    value_input = SQLFORM.widgets[field_type].widget(field, field.default, _id=_id, _class='form-control')
+                    widget_ = SQLFORM.widgets[field_type]
+                    value_input = widget_.widget(field, field.default, _id=_id, 
+                                                 _class=widget_._class + ' form-control')
                 elif field_type == 'date':
-                    iso_format = {'_data-w2p_date_format' : '%Y-%m-%d'}
-                    value_input = SQLFORM.widgets.date.widget(field, field.default, _id=_id, _class='form-control', **iso_format)
+                    iso_format = {'_data-w2p_date_format': '%Y-%m-%d'}
+                    widget_ = SQLFORM.widgets.date
+                    value_input = widget_.widget(field, field.default, _id=_id, 
+                                                 _class=widget_._class + ' form-control', 
+                                                 **iso_format)
                 elif field_type == 'datetime':
-                    iso_format = {'_data-w2p_datetime_format' : '%Y-%m-%d %H:%M:%S'}
-                    value_input = SQLFORM.widgets.datetime.widget(field, field.default, _id=_id, _class='form-control', **iso_format)
-                elif (field_type.startswith('reference ') or
-                      field_type.startswith('list:reference ')) and \
-                      hasattr(field.requires, 'options'):
+                    iso_format = {'_data-w2p_datetime_format': '%Y-%m-%d %H:%M:%S'}
+                    widget_ = SQLFORM.widgets.datetime
+                    value_input = widget_.widget(field, field.default, _id=_id, 
+                                                 _class=widget_._class + ' form-control', 
+                                                 **iso_format)
+                elif hasattr(field.requires, 'options'):
                     value_input = SELECT(
                         *[OPTION(v, _value=k)
                           for k, v in field.requires.options()],
                          _class='form-control',
                          **dict(_id=_id))
-                elif field_type.startswith('reference ') or \
-                     field_type.startswith('list:integer') or \
-                     field_type.startswith('list:reference '):
-                    value_input = SQLFORM.widgets.integer.widget(field, field.default, _id=_id, _class='form-control')
+                elif (field_type.startswith('integer') or
+                      field_type.startswith('reference ') or
+                      field_type.startswith('list:integer') or
+                      field_type.startswith('list:reference ')):
+                    widget_ = SQLFORM.widgets.integer
+                    value_input = widget_.widget(
+                        field, field.default, _id=_id, 
+                        _class=widget_._class + ' form-control')
                 else:
                     value_input = INPUT(
                         _type='text', _id=_id,
@@ -1971,6 +2044,8 @@ class SQLFORM(FORM):
              use_cursor=False):
 
         formstyle = formstyle or current.response.formstyle
+        if isinstance(query, Set): 
+            query = query.query
 
         # jQuery UI ThemeRoller classes (empty if ui is disabled)
         if ui == 'jquery-ui':
@@ -2040,7 +2115,7 @@ class SQLFORM(FORM):
             ## if it's not an integer
             if cache_count is None or isinstance(cache_count, tuple):
                 if groupby:
-                    c = 'count(*)'
+                    c = 'count(*) AS count_all'
                     nrows = db.executesql(
                         'select count(*) from (%s) _tmp;' %
                         dbset._select(c, left=left, cacheable=True,
@@ -2075,7 +2150,7 @@ class SQLFORM(FORM):
             elif isinstance(orderby, Field) and orderby is not field_id:
                 # here we're with an ASC order on a field stored as orderby
                 orderby = orderby | field_id
-            elif (isinstance(orderby, Expression) and 
+            elif (isinstance(orderby, Expression) and
                   orderby.first and orderby.first is not field_id):
                 # here we're with a DESC order on a field stored as orderby.first
                 orderby = orderby | field_id
@@ -2106,10 +2181,8 @@ class SQLFORM(FORM):
         # - url has valid signature (vars are not signed, only path_info)
         # = url does not contain 'create','delete','edit' (readonly)
         if user_signature:
-            if not (
-                '/'.join(str(a) for a in args) == '/'.join(request.args) or
-                URL.verify(request, user_signature=user_signature,
-                           hash_vars=False) or
+            if not ('/'.join(map(str,args)) == '/'.join(map(str,request.args)) or
+                    URL.verify(request, user_signature=user_signature, hash_vars=False) or
                     (request.args(len(args)) == 'view' and not logged)):
                 session.flash = T('not authorized')
                 redirect(referrer)
@@ -2118,7 +2191,7 @@ class SQLFORM(FORM):
                        buttonurl=url(args=[]), callback=None,
                        delete=None, trap=True, noconfirm=None, title=None):
             if showbuttontext:
-                return A(SPAN(_class=ui.get(buttonclass)),
+                return A(SPAN(_class=ui.get(buttonclass)), CAT(' '),
                          SPAN(T(buttontext), _title=title or T(buttontext),
                               _class=ui.get('buttontext')),
                          _href=buttonurl,
@@ -2296,7 +2369,7 @@ class SQLFORM(FORM):
                 if deletable(record):
                     if ondelete:
                         ondelete(table, request.args[-1])
-                    record.delete_record()
+                    db(table[table._id.name] == request.args[-1]).delete()
             if request.ajax:
                 # this means javascript is enabled, so we don't need to do
                 # a redirect
@@ -2662,7 +2735,7 @@ class SQLFORM(FORM):
             htmltable = TABLE(COLGROUP(*cols), THEAD(head))
             tbody = TBODY()
             numrec = 0
-            repr_cache = {}
+            repr_cache = CacheRepresenter()
             for row in rows:
                 trcols = []
                 id = row[field_id]
@@ -2675,31 +2748,24 @@ class SQLFORM(FORM):
                         continue
                     if field.type == 'blob':
                         continue
-                    value = row[str(field)]
+                    if isinstance(field, Field.Virtual) and field.tablename in row:
+                        try:
+                            # fast path, works for joins
+                            value = row[field.tablename][field.name]
+                        except KeyError:
+                            value = dbset.db[field.tablename][row[field.tablename][field_id]][field.name]
+                    else:
+                        value = row[str(field)]
                     maxlength = maxtextlengths.get(str(field), maxtextlength)
                     if field.represent:
                         if field.type.startswith('reference'):
-                            if field not in repr_cache:
-                                repr_cache[field] = {}
-                            try:
-                                nvalue = repr_cache[field][value]
-                            except KeyError:
-                                try:
-                                    nvalue = field.represent(value, row)
-                                except KeyError:
-                                    try:
-                                        nvalue = field.represent(
-                                            value, row[field.tablename])
-                                    except KeyError:
-                                        nvalue = None
-                                repr_cache[field][value] = nvalue
+                            nvalue = repr_cache(field, value, row)
                         else:
                             try:
                                 nvalue = field.represent(value, row)
                             except KeyError:
                                 try:
-                                    nvalue = field.represent(
-                                        value, row[field.tablename])
+                                    nvalue = field.represent(value, row[field.tablename])
                                 except KeyError:
                                     nvalue = None
                         value = nvalue
@@ -2977,7 +3043,16 @@ class SQLFORM(FORM):
             query = query & constraints[table._tablename]
         if isinstance(links, dict):
             links = links.get(table._tablename, [])
-        for key in 'columns,orderby,searchable,sortable,paginate,deletable,editable,details,selectable,create,fields'.split(','):
+        for key in ('fields', 'field_id', 'left', 'headers', 'orderby', 'groupby', 'searchable', 
+                    'sortable', 'paginate', 'deletable', 'editable', 'details', 'selectable',
+                    'create', 'csv', 'links', 'links_in_grid', 'upload', 'maxtextlengths',
+                    'maxtextlength', 'onvalidation', 'onfailure', 'oncreate', 'onupdate',
+                    'ondelete', 'sorter_icons', 'ui', 'showbuttontext', '_class', 'formname',
+                    'search_widget', 'advanced_search', 'ignore_rw', 'formstyle', 'exportclasses',
+                    'formargs', 'createargs', 'editargs', 'viewargs', 'selectable_submit_button',
+                    'buttons_placement', 'links_placement', 'noconfirm', 'cache_count', 'client_side_delete',
+                    'ignore_common_filters', 'auto_pagination', 'use_cursor'
+                   ):
             if isinstance(kwargs.get(key, None), dict):
                 if table._tablename in kwargs[key]:
                     kwargs[key] = kwargs[key][table._tablename]

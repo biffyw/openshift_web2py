@@ -59,6 +59,8 @@ def app_pack(app, request, raise_ex=False, filenames=None):
         w2p_pack(filename, apath(app, request), filenames=filenames)
         return filename
     except Exception, e:
+        import traceback
+        print traceback.format_exc()
         if raise_ex:
             raise
         return False
@@ -119,9 +121,8 @@ def app_cleanup(app, request):
 
     # Remove cache files
     path = apath('%s/cache/' % app, request)
-    CacheOnDisk(folder=path).clear()
-    
     if os.path.exists(path):
+        CacheOnDisk(folder=path).clear()
         for f in os.listdir(path):
             try:
                 if f[:1] != '.': recursive_unlink(os.path.join(path, f))
@@ -130,7 +131,7 @@ def app_cleanup(app, request):
     return r
 
 
-def app_compile(app, request):
+def app_compile(app, request, skip_failed_views=False):
     """Compiles the application
 
     Args:
@@ -144,10 +145,10 @@ def app_compile(app, request):
     from compileapp import compile_application, remove_compiled_application
     folder = apath(app, request)
     try:
-        compile_application(folder)
-        return None
+        failed_views = compile_application(folder, skip_failed_views)
+        return failed_views
     except (Exception, RestrictedError):
-        tb = traceback.format_exc(sys.exc_info)
+        tb = traceback.format_exc()
         remove_compiled_application(folder)
         return tb
 
@@ -166,7 +167,7 @@ def app_create(app, request, force=False, key=None, info=False):
             os.mkdir(path)
         except:
             if info:
-                return False, traceback.format_exc(sys.exc_info)
+                return False, traceback.format_exc()
             else:
                 return False
     elif not force:
@@ -196,7 +197,7 @@ def app_create(app, request, force=False, key=None, info=False):
     except:
         rmtree(path)
         if info:
-            return False, traceback.format_exc(sys.exc_info)
+            return False, traceback.format_exc()
         else:
             return False
 

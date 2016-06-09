@@ -80,10 +80,9 @@ locale.setlocale(locale.LC_CTYPE, "C") # IMPORTANT, web2py requires locale "C"
 exists = os.path.exists
 pjoin = os.path.join
 
-logpath = abspath("logging.conf")
-if exists(logpath):
+try:
     logging.config.fileConfig(abspath("logging.conf"))
-else:
+except: # fails on GAE or when logfile is missing
     logging.basicConfig()
 logger = logging.getLogger("web2py")
 
@@ -361,7 +360,7 @@ def wsgibase(environ, responder):
                     local_hosts = global_settings.local_hosts
                 client = get_client(env)
                 x_req_with = str(env.http_x_requested_with).lower()
-                cmd_opts = request.global_settings.cmd_options
+                cmd_opts = global_settings.cmd_options
 
                 request.update(
                     client = client,
@@ -370,8 +369,8 @@ def wsgibase(environ, responder):
                     cid = env.http_web2py_component_element,
                     is_local = (env.remote_addr in local_hosts and
                                 client == env.remote_addr),
-                    is_shell = cmd_opts and cmd_opts.shell,
-                    is_sheduler = cmd_opts and cmd_opts.scheduler,
+                    is_shell = False,
+                    is_scheduler = False,
                     is_https = env.wsgi_url_scheme in HTTPS_SCHEMES or \
                         request.env.http_x_forwarded_proto in HTTPS_SCHEMES \
                         or env.https == 'on'
@@ -423,10 +422,13 @@ def wsgibase(environ, responder):
                 # ##################################################
 
                 if env.http_cookie:
-                    try:
-                        request.cookies.load(env.http_cookie)
-                    except Cookie.CookieError, e:
-                        pass  # invalid cookies
+                    for single_cookie in env.http_cookie.split(';'):
+                        single_cookie = single_cookie.strip()
+                        if single_cookie:
+                            try:
+                                request.cookies.load(single_cookie)
+                            except Cookie.CookieError:
+                                pass  # single invalid cookie ignore
 
                 # ##################################################
                 # try load session or create new session file

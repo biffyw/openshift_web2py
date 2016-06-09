@@ -197,7 +197,10 @@ def smart_query(fields, text):
             elif op == '!=': new_query = field != value
             elif op == 'belongs': new_query = field.belongs(value.split(','))
             elif op == 'notbelongs': new_query = ~field.belongs(value.split(','))
-            elif field.type in ('text', 'string', 'json'):
+            elif field.type == 'list:string':
+                if op == 'contains': new_query = field.contains(value)
+                else: raise RuntimeError("Invalid operation")
+            elif field.type in ('text', 'string', 'json', 'upload'):
                 if op == 'contains': new_query = field.contains(value)
                 elif op == 'like': new_query = field.ilike(value)
                 elif op == 'startswith': new_query = field.startswith(value)
@@ -277,7 +280,7 @@ class _repr_ref_list(_repr_ref):
         else:
             refs = db(id.belongs(value)).select(id)
         return refs and ', '.join(
-            _fieldformat(self.ref, x.id) for x in value) or ''
+            _fieldformat(self.ref, x) for x in value) or ''
 
 
 def auto_represent(field):

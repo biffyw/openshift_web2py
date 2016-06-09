@@ -8,3 +8,4 @@ else:
 from .validation import *
 from .caching import TestCache
 from .smart_query import *
+from .base import *
