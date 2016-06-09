@@ -1,8 +1,8 @@
 NOTICE:
 ========
-This repository is a fork of https://github.com/prelegalwonder/openshift_web2py.
-I only make this fork with intent of keep the web2py version up-to-date.
-This fork is tested on python-2.7 cartridge.
+This repository is a fork of https://github.com/glaucojunior22/openshift_web2py, which in turn is a fork of https://github.com/prelegalwonder/openshift_web2py.
+
+This fork updates web2py to 2.14 and is tested on python-2.7 cartridge.
 
 Web2Py on OpenShift
 ===================
@@ -21,7 +21,7 @@ Create an account at http://openshift.redhat.com/
 
 Create a python-2.7 application
 
-    rhc create-app web2py python-2.7 --from-code https://github.com/glaucojunior22/openshift_web2py.git
+    rhc create-app web2py python-2.7 --from-code https://github.com/biffyw/openshift_web2py.git
 
 That's it, you can now checkout your application at:
 
